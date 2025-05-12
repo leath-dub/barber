@@ -1,0 +1,16 @@
+.{
+    .name = .barber,
+    .version = "0.0.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .wayland = .{
+            .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.3.0.tar.gz",
+            .hash = "wayland-0.3.0-lQa1kjPIAQDmhGYpY-zxiRzQJFHQ2VqhJkQLbKKdt5wl",
+        },
+    },
+    .fingerprint = 0x7c48a9a4c867c82f,
+}
