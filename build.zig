@@ -24,6 +24,10 @@ pub fn build(b: *Build) !void {
         .optimize = optimize,
     });
 
+    const zmesh = b.dependency("zmesh", .{ .target = target });
+    exe.root_module.addImport("zmesh", zmesh.module("root"));
+    exe.linkLibrary(zmesh.artifact("zmesh"));
+
     exe.root_module.addImport("wayland", wayland);
     exe.linkLibC();
     exe.linkSystemLibrary("wayland-client");

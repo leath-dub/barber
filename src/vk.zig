@@ -4,11 +4,7 @@ const std = @import("std");
 const mem = std.mem;
 const log = std.log;
 
-const c = @cImport({
-    @cInclude("vulkan/vulkan.h");
-    @cInclude("glslang/Include/glslang_c_interface.h");
-    @cInclude("glslang/Public/resource_limits_c.h");
-});
+const c = @import("c.zig").includes;
 
 fn camelToTitle(comptime input: []const u8) std.meta.Tuple(&.{usize, [input.len + input.len]u8}) {
     var r = std.mem.zeroes([input.len + input.len]u8);

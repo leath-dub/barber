@@ -6,12 +6,16 @@ const mem = std.mem;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 
-const c = @cImport({
-    @cInclude("vulkan/vulkan.h");
-    @cInclude("vulkan/vulkan_wayland.h");
-});
-
 const vk = @import("vk.zig");
+const mesh = @import("mesh.zig");
+const Device = @import("device.zig");
+const Vert = mesh.Vert;
+const Verts = mesh.Verts;
+const Mesh = mesh.Mesh;
+
+const c = @import("c.zig").includes;
+
+const zmesh = @import("zmesh");
 
 pub const VulkanContext = @This();
 
@@ -39,6 +43,10 @@ fences: []c.VkFence,
 semaphores: []c.VkSemaphore,
 frame: usize = 0,
 
+object: Mesh,
+
+messenger: c.VkDebugUtilsMessengerEXT,
+
 const DEFAULT_FORMAT: c.VkFormat = c.VK_FORMAT_R8G8B8A8_UNORM;
 const DEFAULT_COLORSPACE: c.VkColorSpaceKHR = c.VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 
@@ -47,24 +55,58 @@ const FRAGMENT_SHADER_DATA = @embedFile("shaders/fragment.glsl");
 
 const MAX_FRAMES_IN_FLIGHT = 2;
 
+fn debugCallback(serverity: c.VkDebugUtilsMessageSeverityFlagBitsEXT, message_type: c.VkDebugUtilsMessageTypeFlagsEXT, callback_data: [*c]const c.VkDebugUtilsMessengerCallbackDataEXT, user_data: ?*anyopaque) callconv(.c) c.VkBool32 {
+    _ = message_type;
+    _ = user_data;
+    const severity_str = switch (serverity) {
+        c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT => "error",
+        c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT => "verbose",
+        c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT => "info",
+        c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT => "warning",
+        else => unreachable,
+    };
+    log.debug("-- VULKAN ({s}) -- {s}", .{severity_str, callback_data.*.pMessage});
+    return c.VK_FALSE;
+}
+
 pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator, width: u32, height: u32, surface: *wl.Surface, display: *wl.Display) !VulkanContext {
     var arena = std.heap.ArenaAllocator.init(safe_allocator);
     errdefer arena.deinit();
 
-    const instance_extensions = [_][*:0]const u8{ "VK_KHR_wayland_surface", "VK_KHR_surface" };
-    const instance_create_info = vk.SType(c.VkInstanceCreateInfo, .{
+    const enabled = [_]c.VkValidationFeatureEnableEXT{c.VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT};
+    var features = vk.SType(c.VkValidationFeaturesEXT, .{
+        .enabledValidationFeatureCount = 1,
+        .pEnabledValidationFeatures = &enabled,
+    });
+
+    const instance_extensions = [_][*:0]const u8{ "VK_KHR_wayland_surface", "VK_KHR_surface", "VK_EXT_debug_utils" };
+    var instance_create_info = vk.SType(c.VkInstanceCreateInfo, .{
         .pApplicationInfo = &vk.SType(c.VkApplicationInfo, .{
             .pApplicationName = "barber",
             .applicationVersion = comptime c.VK_MAKE_VERSION(0, 0, 1),
-            .apiVersion = comptime c.VK_MAKE_VERSION(1, 2, 0),
+            .apiVersion = comptime c.VK_MAKE_VERSION(1, 3, 0),
         }),
         .enabledExtensionCount = instance_extensions[0..].len,
         .ppEnabledExtensionNames = &instance_extensions,
     });
 
+    features.pNext = instance_create_info.pNext;
+    instance_create_info.pNext = &features;
+
     var instance: c.VkInstance = undefined;
     try vk.check(c.vkCreateInstance(&withLayerIfAvailable(temp_allocator, "VK_LAYER_KHRONOS_validation", instance_create_info), null, &instance));
-    log.info("vulkan version 1.2 instance acquired", .{});
+    log.info("vulkan version 1.3 instance acquired", .{});
+
+    const debug_utils_info = vk.SType(c.VkDebugUtilsMessengerCreateInfoEXT, .{
+        .messageSeverity = c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
+        .messageType = c.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | c.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | c.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT | c.VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT,
+        .pfnUserCallback = debugCallback,
+    });
+    var messenger: c.VkDebugUtilsMessengerEXT = undefined;
+
+    const vkCreateDebugUtilsMessengerEXT: c.PFN_vkCreateDebugUtilsMessengerEXT = @ptrCast(c.vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+    try vk.check(vkCreateDebugUtilsMessengerEXT.?(instance, &debug_utils_info, null, &messenger));
+ 
 
     const surface_create_info = vk.SType(c.VkWaylandSurfaceCreateInfoKHR, .{
         .display = @ptrCast(display),
@@ -74,10 +116,12 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
     try vk.check(c.vkCreateWaylandSurfaceKHR(instance, &surface_create_info, null, &vk_surface));
  
     const device = Device.select(temp_allocator, instance, vk_surface) orelse {
-        log.err("failed to find suitable vulkan device. need version >=1.2 with graphics and bgra image format", .{});
+        log.err("failed to find suitable vulkan device. need version >=1.3 with graphics and bgra image format", .{});
         return error.NoSuitableVulkanDevice;
     };
     errdefer device.deinit();
+
+    // Setup vertices
     
     // Create a render pass
     // Attachments are dependencies between rendering steps (e.g. textures)
@@ -108,6 +152,36 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
 
     const swapchain = try Swapchain.init(safe_allocator, render_pass, width, height, device, vk_surface);
 
+    const object = object: {
+        var pool_info = vk.SType(c.VkCommandPoolCreateInfo, .{
+            .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = device.getGraphicsQueueIndex()
+        });
+        var command_pool: c.VkCommandPool = undefined;
+        try vk.check(c.vkCreateCommandPool(device.logical, &pool_info, null, &command_pool));
+        defer c.vkDestroyCommandPool(device.logical, command_pool, null);
+
+        var allocate_info = vk.SType(c.VkCommandBufferAllocateInfo, .{
+            .commandPool = command_pool,
+            .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = @intCast(swapchain.images.len),
+        });
+        var copy_cmdbuf: c.VkCommandBuffer = undefined;
+        try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, &copy_cmdbuf));
+        defer c.vkFreeCommandBuffers(device.logical, command_pool, 1, &copy_cmdbuf);
+
+        // const cube = zmesh.Shape.initCube();
+        // defer cube.deinit();
+
+        const verts = try Verts.with(safe_allocator, &.{
+            Vert.of(.{.{-1, 1, 0}, .{1, 0}}),
+            Vert.of(.{.{0, -1, 0}, .{0, 1}}),
+            Vert.of(.{.{1, 1, 0}, .{1, 1}}),
+        });
+        defer verts.deinit();
+        break :object try Mesh.init(device, copy_cmdbuf, verts);
+    };
+
     // Setup a graphics pipeline
     const vertex_spirv = try vk.compileShader(temp_allocator, .vertex, VERTEX_SHADER_DATA);
     const fragment_spirv = try vk.compileShader(temp_allocator, .fragment, FRAGMENT_SHADER_DATA);
@@ -129,7 +203,31 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         vk.SType(c.VkPipelineShaderStageCreateInfo, .{ .stage = c.VK_SHADER_STAGE_VERTEX_BIT, .module = vertex_shader, .pName = "main" }),
         vk.SType(c.VkPipelineShaderStageCreateInfo, .{ .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragment_shader, .pName = "main" }),
     };
-    const vertex_input_info = vk.SType(c.VkPipelineVertexInputStateCreateInfo, .{});
+
+    const VertexBindings = std.enums.EnumArray(std.meta.FieldEnum(Vert), c.VkVertexInputBindingDescription);
+    var vertex_bindings = VertexBindings.initUndefined();
+    inline for (comptime std.meta.tags(std.meta.FieldEnum(Vert))) |field| {
+        vertex_bindings.set(field, .{ .binding = @intCast(VertexBindings.Indexer.indexOf(field)), .stride = @sizeOf(@FieldType(Vert, @tagName(field))), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX });
+    }
+
+    const field_to_vktype = std.enums.EnumMap(std.meta.FieldEnum(Vert), c.VkFormat).init(.{
+        .position = c.VK_FORMAT_R32G32B32_SFLOAT,
+        .texel = c.VK_FORMAT_R32G32_SFLOAT,
+    });
+
+    const VertexAttrs = std.enums.EnumArray(std.meta.FieldEnum(Vert), c.VkVertexInputAttributeDescription);
+    var vertex_attrs = VertexAttrs.initUndefined();
+    inline for (comptime std.meta.tags(std.meta.FieldEnum(Vert))) |field| {
+        const index = VertexAttrs.Indexer.indexOf(field);
+        vertex_attrs.set(field, .{ .binding = @intCast(index), .location = @intCast(index), .format = field_to_vktype.get(field).?, .offset = 0 });
+    }
+
+    const vertex_input_info = vk.SType(c.VkPipelineVertexInputStateCreateInfo, .{
+        .vertexBindingDescriptionCount = vertex_bindings.values.len,
+        .pVertexBindingDescriptions = &vertex_bindings.values,
+        .vertexAttributeDescriptionCount = vertex_attrs.values.len,
+        .pVertexAttributeDescriptions = &vertex_attrs.values,
+    });
     const input_assembly_info = vk.SType(c.VkPipelineInputAssemblyStateCreateInfo, .{ .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST });
     const viewport_info = vk.SType(c.VkPipelineViewportStateCreateInfo, .{
         .viewportCount = 1,
@@ -141,7 +239,6 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
             .minDepth = 0,
             .maxDepth = 1,
         },
-        // Scissor is maybe not necessary ?
         .scissorCount = 1,
         .pScissors = &c.VkRect2D {
             .offset = .{ .x = 0, .y = 0 },
@@ -166,7 +263,10 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         }),
     });
 
-    const layout_info = vk.SType(c.VkPipelineLayoutCreateInfo, .{});
+    const layout_info = vk.SType(c.VkPipelineLayoutCreateInfo, .{
+        .setLayoutCount = 0,
+        .pSetLayouts = null,
+    });
     var pipeline_layout: c.VkPipelineLayout = undefined;
     try vk.check(c.vkCreatePipelineLayout(device.logical, &layout_info, null, &pipeline_layout));
 
@@ -216,14 +316,41 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .pClearValues = &c.VkClearValue { .color = .{ .float32 = .{0, 0, 0, 0} } },
     });
 
+    // Bind vertex data
+    // {
+    //     const pool_info_ = vk.SType(c.VkCommandPoolCreateInfo, .{
+    //         .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+    //         .queueFamilyIndex = device.getGraphicsQueueIndex()
+    //     });
+    //     var command_pool_: c.VkCommandPool = undefined;
+    //     try vk.check(c.vkCreateCommandPool(device.logical, &pool_info_, null, &command_pool_));
+    //     defer c.vkDestroyCommandPool(device.logical, command_pool_, null);
+    //     var vertex_cmdbuf: c.VkCommandBuffer = undefined;
+    //     try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, &vertex_cmdbuf));
+    //
+    //     var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{ .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT });
+    //     try vk.check(c.vkBeginCommandBuffer(vertex_cmdbuf, &begin_info));
+    //     std.debug.print("foo: {any}\n", .{object.buffers.values});
+    //     c.vkCmdBindVertexBuffers(vertex_cmdbuf, 0, 2, &object.buffers.values, &std.mem.zeroes([object.buffers.values.len]u64));
+    //     try vk.check(c.vkEndCommandBuffer(vertex_cmdbuf));
+    //
+    //     const gq = device.getGraphicsQueue();
+    //     var submit_info = vk.SType(c.VkSubmitInfo, .{
+    //         .commandBufferCount = 1,
+    //         .pCommandBuffers = &vertex_cmdbuf,
+    //     });
+    //     try vk.check(c.vkQueueSubmit(gq, 1, &submit_info, null));
+    //     try vk.check(c.vkQueueWaitIdle(gq));
+    // }
+
     for (command_buffers, 0..) |command_buffer, i| {
         var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{ .flags = c.VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT });
         try vk.check(c.vkBeginCommandBuffer(command_buffer, &begin_info));
 
         render_pass_begin_info.framebuffer = swapchain.framebuffers[i];
         c.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
-
         c.vkCmdBindPipeline(command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        c.vkCmdBindVertexBuffers(command_buffer, 0, 2, &object.buffers.values, &std.mem.zeroes([object.buffers.values.len]u64));
         c.vkCmdDraw(command_buffer, 3, 1, 0, 0);
         c.vkCmdEndRenderPass(command_buffer);
 
@@ -264,6 +391,8 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .fences = fences,
         .semaphores = semaphores,
         .frame = 0,
+        .object = object,
+        .messenger = messenger,
     };
 }
 
@@ -305,6 +434,8 @@ pub fn tick(context: *VulkanContext) !void {
 }
 
 pub fn deinit(context: VulkanContext) void {
+    context.object.deinit();
+
     c.vkDestroySurfaceKHR(context.instance, context.surface, null);
     c.vkDestroyShaderModule(context.device.logical, context.vertex_shader, null);
     c.vkDestroyShaderModule(context.device.logical, context.fragment_shader, null);
@@ -321,6 +452,10 @@ pub fn deinit(context: VulkanContext) void {
     c.vkDestroyPipeline(context.device.logical, context.pipeline, null);
     c.vkDestroyRenderPass(context.device.logical, context.render_pass, null);
     context.device.deinit();
+
+    const vkDestroyDebugUtilsMessengerEXT: c.PFN_vkDestroyDebugUtilsMessengerEXT = @ptrCast(c.vkGetInstanceProcAddr(context.instance, "vkDestroyDebugUtilsMessengerEXT"));
+    vkDestroyDebugUtilsMessengerEXT.?(context.instance, context.messenger, null);
+    c.vkDestroyInstance(context.instance, null);
 }
 
 // This is separated from the context directly so that in the future we can separate the lifetime with its own arena.
@@ -430,185 +565,6 @@ const Swapchain = struct {
         }
         swapchain.arena.deinit();
         c.vkDestroySwapchainKHR(context.device.logical, swapchain.handle, null);
-    }
-};
-
-const Device = struct {
-    const QueuePair = struct {
-        index: u32,
-        value: c.VkQueue,
-    };
-
-    const QueueSetup = union(enum) {
-        split: struct {
-            present: QueuePair,
-            graphics: QueuePair,
-        },
-        single: QueuePair, // single queue for graphics and present
-    };
-
-    logical: c.VkDevice,
-    physical: c.VkPhysicalDevice,
-    queue: QueueSetup,
-
-    pub fn select(arena: std.mem.Allocator, instance: c.VkInstance, surface: c.VkSurfaceKHR) ?Device {
-        var devices_count: u32 = 0;
-        vk.check(c.vkEnumeratePhysicalDevices(instance, &devices_count, null)) catch unreachable;
-        if (devices_count == 0) {
-            return null;
-        }
-        var devices = arena.alloc(c.VkPhysicalDevice, devices_count) catch unreachable;
-        vk.check(c.vkEnumeratePhysicalDevices(instance, &devices_count, devices.ptr)) catch unreachable;
-
-        devices.len = devices_count;
-
-        const priority_types = .{ c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, 0 };
-        inline for (priority_types) |prioritize_type| {
-            for (devices) |device| {
-                // Check the device extensions
-                var extensions_count: u32 = 0;
-                vk.check(c.vkEnumerateDeviceExtensionProperties(device, null, &extensions_count, null)) catch unreachable;
-                if (extensions_count == 0) continue;
-
-                var extensions = arena.alloc(c.VkExtensionProperties, extensions_count) catch unreachable;
-                vk.check(c.vkEnumerateDeviceExtensionProperties(device, null, &extensions_count, extensions.ptr)) catch unreachable;
-                extensions.len = extensions_count;
-
-                var swapchain_support = false;
-                for (extensions) |extension| {
-                    const extension_name = "VK_KHR_swapchain";
-                    if (std.mem.orderZ(u8, "VK_KHR_swapchain", @ptrCast(extension.extensionName[0..extension_name.len])) == .eq) {
-                        swapchain_support = true;
-                    }
-                }
-                if (!swapchain_support) continue;
-
-                // Check the device properties
-                var props: c.VkPhysicalDeviceProperties = undefined;
-                c.vkGetPhysicalDeviceProperties(device, &props);
-                if (prioritize_type != 0 and props.deviceType != prioritize_type) continue;
-
-                // Check the features
-                var features: c.VkPhysicalDeviceFeatures = undefined;
-                c.vkGetPhysicalDeviceFeatures(device, &features);
-                if (features.geometryShader == c.VK_FALSE) continue;
-
-                // Check the queue families
-                var queue_family_count: u32 = 0;
-                c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, null);
-                if (queue_family_count == 0) {
-                    continue;
-                }
-
-                var queue_families = arena.alloc(c.VkQueueFamilyProperties, queue_family_count) catch unreachable;
-                c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_families.ptr);
-                queue_families.len = queue_family_count;
-
-                var present_queue_index: ?usize = null;
-                var graphics_queue_index: ?usize = null;
-
-                for (queue_families, 0..) |qf, qi| {
-                    if ((qf.queueFlags & c.VK_QUEUE_GRAPHICS_BIT) != 0) {
-                        graphics_queue_index = qi;
-                    }
-                    var surface_support = c.VK_FALSE;
-                    vk.check(c.vkGetPhysicalDeviceSurfaceSupportKHR(device, @intCast(qi), surface, &surface_support)) catch unreachable;
-                    if (surface_support == c.VK_TRUE) {
-                        present_queue_index = qi;
-                    }
-                }
-                if (graphics_queue_index == null or present_queue_index == null) continue;
-
-                // We don't need to check for surface format support right now
-                // as we are using one of the mandatory formats VK_FORMAT_R8G8B8A8_UNORM
-                var formats_count: u32 = 0;
-                vk.check(c.vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formats_count, null)) catch unreachable;
-                if (formats_count == 0) continue;
-
-                var present_modes_count: u32 = 0;
-                vk.check(c.vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &present_modes_count, null)) catch unreachable;
-                if (present_modes_count == 0) continue;
-
-                // Device is suitable, setup logical device and fetch the graphics queue
- 
-                var device_create_info = vk.SType(c.VkDeviceCreateInfo, .{
-                    .queueCreateInfoCount = 1,
-                    .pQueueCreateInfos = &vk.SType(c.VkDeviceQueueCreateInfo, .{
-                        .queueCount = 1, // we are only submitting to one queue even if more are available
-                        .pQueuePriorities = &@as(f32, 0.0),
-                        .queueFamilyIndex = @intCast(graphics_queue_index.?),
-                    }),
-                    .enabledExtensionCount = 1,
-                    .ppEnabledExtensionNames = &"VK_KHR_swapchain".ptr,
-                });
-                var logical_device: c.VkDevice = undefined;
-                vk.check(c.vkCreateDevice(device, &device_create_info, null, &logical_device)) catch unreachable;
-
-                var queue: QueueSetup = undefined;
-                if (graphics_queue_index.? == present_queue_index.?) {
-                    var graphics_queue: c.VkQueue = undefined;
-                    c.vkGetDeviceQueue(logical_device, @intCast(graphics_queue_index.?), 0, &graphics_queue);
-                    queue = .{
-                        .single = .{
-                            .index = @intCast(graphics_queue_index.?),
-                            .value = graphics_queue,
-                        }
-                    };
-                } else {
-                    var present_queue: c.VkQueue = undefined;
-                    c.vkGetDeviceQueue(logical_device, @intCast(present_queue_index.?), 0, &present_queue);
-                    var graphics_queue: c.VkQueue = undefined;
-                    c.vkGetDeviceQueue(logical_device, @intCast(graphics_queue_index.?), 0, &graphics_queue);
-                    queue = .{
-                        .split = .{
-                            .present = .{
-                                .index = @intCast(present_queue_index.?),
-                                .value = present_queue,
-                            },
-                            .graphics = .{
-                                .index = @intCast(graphics_queue_index.?),
-                                .value = graphics_queue,
-                            },
-                        },
-                    };
-                }
-
-                log.info("selected vulkan device '{s}'", .{props.deviceName});
-
-                return .{
-                    .physical = device,
-                    .logical = logical_device,
-                    .queue = queue,
-                };
-            }
-        }
-
-        return null;
-    }
-
-    pub fn getGraphicsQueueIndex(device: Device) u32 {
-        switch (device.queue) {
-            .single => |queue| return queue.index,
-            .split => |queue_pair| return queue_pair.graphics.index,
-        }
-    }
-
-    pub fn getGraphicsQueue(device: Device) c.VkQueue {
-        switch (device.queue) {
-            .single => |queue| return queue.value,
-            .split => |queue_pair| return queue_pair.graphics.value,
-        }
-    }
-
-    pub fn getPresentQueue(device: Device) c.VkQueue {
-        switch (device.queue) {
-            .single => |queue| return queue.value,
-            .split => |queue_pair| return queue_pair.present.value,
-        }
-    }
-
-    pub fn deinit(device: Device) void {
-        c.vkDestroyDevice(device.logical, null);
     }
 };
 

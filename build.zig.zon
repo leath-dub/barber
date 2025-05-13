@@ -11,6 +11,10 @@
             .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.3.0.tar.gz",
             .hash = "wayland-0.3.0-lQa1kjPIAQDmhGYpY-zxiRzQJFHQ2VqhJkQLbKKdt5wl",
         },
+        .zmesh = .{
+            .url = "https://github.com/zig-gamedev/zmesh/archive/f8f528128704ae879a16ddb0a3470c5e0a144a20.tar.gz",
+            .hash = "zmesh-0.11.0-dev-oO3A5gx7CgCBPHsGeuNzwzXAyEvs57u39AD5EUZTScli",
+        },
     },
     .fingerprint = 0x7c48a9a4c867c82f,
 }

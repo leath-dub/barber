@@ -9,6 +9,10 @@ const zwlr = wayland.client.zwlr;
 
 const Backend = @import("backend.zig");
 
+const zmesh = @import("zmesh");
+
+const c = @import("c.zig").includes;
+
 pub fn abort(comptime format: []const u8, args: anytype) noreturn {
     log.err(format, args);
     posix.exit(1);
@@ -65,6 +69,9 @@ pub fn main() !void {
             @panic("Memory leaks detected");
         }
     }
+    zmesh.init(safe_allocator.allocator());
+    defer zmesh.deinit();
+
     var arena_allocator = std.heap.ArenaAllocator.init(safe_allocator.allocator());
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
