@@ -9,7 +9,7 @@ pub fn build(b: *Build) !void {
 
     const scanner = Scanner.create(b, .{});
     const wayland = b.createModule(.{ .root_source_file = scanner.result });
-
+    
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml"); // needed by wlr-layer-shell
     scanner.addCustomProtocol(b.path("wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml"));
 
@@ -28,6 +28,10 @@ pub fn build(b: *Build) !void {
     exe.linkLibC();
     exe.linkSystemLibrary("wayland-client");
     exe.linkSystemLibrary("vulkan");
+ 
+    // Shader compilation is done at runtime for more flexiblity (maybe custom shaders in the future?) using glslang
+    exe.linkSystemLibrary("glslang");
+    exe.linkSystemLibrary("glslang-default-resource-limits");
 
     b.installArtifact(exe);
 

@@ -6,6 +6,8 @@ const log = std.log;
 
 const c = @cImport({
     @cInclude("vulkan/vulkan.h");
+    @cInclude("glslang/Include/glslang_c_interface.h");
+    @cInclude("glslang/Public/resource_limits_c.h");
 });
 
 fn camelToTitle(comptime input: []const u8) std.meta.Tuple(&.{usize, [input.len + input.len]u8}) {
@@ -40,6 +42,81 @@ pub fn SType(comptime T: type, value_: T) T {
     var value = value_;
     value.sType = @field(c, fieldName);
     return value;
+}
+
+const ShaderStage = enum(c_uint) {
+    vertex,
+    tesscontrol,
+    tessevaluation,
+    geometry,
+    fragment,
+    compute,
+    raygen,
+    intersect,
+    anyhit,
+    closest_hit,
+    miss,
+    callable,
+    task,
+    mesh,
+};
+
+
+pub fn compileShader(allocator: mem.Allocator, stage: ShaderStage, glslText: [*:0]const u8) ![]u32 {
+    _ = c.glslang_initialize_process();
+    defer c.glslang_finalize_process();
+
+    const input = mem.zeroInit(c.glslang_input_t, .{
+        .language  = c.GLSLANG_SOURCE_GLSL,
+        .stage = @intFromEnum(stage),
+        .client = c.GLSLANG_CLIENT_VULKAN,
+        .client_version = c.GLSLANG_TARGET_VULKAN_1_2,
+        .target_language = c.GLSLANG_TARGET_SPV,
+        .target_language_version = c.GLSLANG_TARGET_SPV_1_3,
+        .code = glslText,
+        .default_version = 100,
+        .default_profile = c.GLSLANG_NO_PROFILE,
+        .messages = c.GLSLANG_MSG_DEFAULT_BIT,
+        .resource = c.glslang_default_resource(),
+    });
+
+    const shader = c.glslang_shader_create(&input);
+    defer c.glslang_shader_delete(shader);
+
+    if (c.glslang_shader_preprocess(shader, &input) == 0) {
+        log.err("glsl info: {s}", .{c.glslang_shader_get_info_log(shader)});
+        log.err("glsl debug: {s}", .{c.glslang_shader_get_info_debug_log(shader)});
+        return error.ShaderPreProcessFailed;
+    }
+
+    if (c.glslang_shader_parse(shader, &input) == 0) {
+        log.err("glsl info: {s}", .{c.glslang_shader_get_info_log(shader)});
+        log.err("glsl debug: {s}", .{c.glslang_shader_get_info_debug_log(shader)});
+        return error.ShaderParseFailed;
+    }
+
+    const program = c.glslang_program_create();
+    defer c.glslang_program_delete(program);
+    c.glslang_program_add_shader(program, shader);
+
+    if (c.glslang_program_link(program, c.GLSLANG_MSG_SPV_RULES_BIT | c.GLSLANG_MSG_VULKAN_RULES_BIT) == 0) {
+        log.err("glsl info: {s}", .{c.glslang_program_get_info_log(program)});
+        log.err("glsl debug: {s}", .{c.glslang_program_get_info_debug_log(program)});
+        return error.ShaderLinkingFailed;
+    }
+
+    c.glslang_program_SPIRV_generate(program, @intFromEnum(stage));
+
+    const spirv_size = c.glslang_program_SPIRV_get_size(program);
+    var spirv = try allocator.alloc(u32, spirv_size);
+    c.glslang_program_SPIRV_get(program, spirv.ptr);
+    spirv.len = spirv_size;
+
+    if (c.glslang_program_SPIRV_get_messages(program)) |messages| {
+        log.info("SPIR-V message: {s}", .{messages});
+    }
+
+    return spirv;
 }
 
 const Result = enum(c_int) {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = std.log;
+const fs = std.fs;
 
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -25,6 +26,9 @@ command_pool: c.VkCommandPool,
 command_buffers: []c.VkCommandBuffer,
 render_complete: c.VkSemaphore,
 present_complete: c.VkSemaphore,
+
+const VERTEX_SHADER_DATA = @embedFile("shaders/vertex.glsl");
+const FRAGMENT_SHADER_DATA = @embedFile("shaders/fragment.glsl");
 
 pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator, width: u32, height: u32, surface: *wl.Surface, display: *wl.Display) !VulkanContext {
     var arena = std.heap.ArenaAllocator.init(safe_allocator);
@@ -80,7 +84,7 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
     for (command_buffers, 0..) |command_buffer, i| {
         var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{});
         try vk.check(c.vkBeginCommandBuffer(command_buffer, &begin_info));
-        c.vkCmdClearColorImage(command_buffer, swapchain.images[i], c.VK_IMAGE_LAYOUT_GENERAL, &.{ .float32 = .{1, 0, 0, 1} }, 1, &std.mem.zeroInit(c.VkImageSubresourceRange, .{
+        c.vkCmdClearColorImage(command_buffer, swapchain.images[i], c.VK_IMAGE_LAYOUT_GENERAL, &.{ .float32 = .{0, 0, 0, 0} }, 1, &std.mem.zeroInit(c.VkImageSubresourceRange, .{
             .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
             .levelCount = 1,
             .layerCount = 1,
@@ -93,6 +97,27 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
     var present_complete: c.VkSemaphore = undefined;
     try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, &render_complete));
     try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, &present_complete));
+
+    // Compile shaders
+    log.info("compiling shaders...", .{});
+
+    const vertex_spirv = try vk.compileShader(temp_allocator, .vertex, VERTEX_SHADER_DATA);
+    const fragment_spirv = try vk.compileShader(temp_allocator, .fragment, FRAGMENT_SHADER_DATA);
+
+    var vertex_shader: c.VkShaderModule = undefined;
+    var fragment_shader: c.VkShaderModule = undefined;
+    try vk.check(c.vkCreateShaderModule(device.logical, &vk.SType(c.VkShaderModuleCreateInfo, .{
+         // Even though it takes 32-bit int array it wants byte size - fucking stupid 
+         // I think vulkan may have been designed by bill gates to waste Linux developers time
+        .codeSize = vertex_spirv.len * 4,
+        .pCode = vertex_spirv.ptr,
+    }), null, &vertex_shader));
+    try vk.check(c.vkCreateShaderModule(device.logical, &vk.SType(c.VkShaderModuleCreateInfo, .{
+        .codeSize = fragment_spirv.len * 4,
+        .pCode = fragment_spirv.ptr,
+    }), null, &fragment_shader));
+
+    log.info("finished compiling shaders.", .{});
 
     return .{
         .arena = arena,
