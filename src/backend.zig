@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = std.log;
 const fs = std.fs;
+const mem = std.mem;
 
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -27,8 +28,24 @@ command_buffers: []c.VkCommandBuffer,
 render_complete: c.VkSemaphore,
 present_complete: c.VkSemaphore,
 
+vertex_shader: c.VkShaderModule,
+fragment_shader: c.VkShaderModule,
+
+render_pass: c.VkRenderPass,
+pipeline: c.VkPipeline,
+pipeline_layout: c.VkPipelineLayout,
+
+fences: []c.VkFence,
+semaphores: []c.VkSemaphore,
+frame: usize = 0,
+
+const DEFAULT_FORMAT: c.VkFormat = c.VK_FORMAT_R8G8B8A8_UNORM;
+const DEFAULT_COLORSPACE: c.VkColorSpaceKHR = c.VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+
 const VERTEX_SHADER_DATA = @embedFile("shaders/vertex.glsl");
 const FRAGMENT_SHADER_DATA = @embedFile("shaders/fragment.glsl");
+
+const MAX_FRAMES_IN_FLIGHT = 2;
 
 pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator, width: u32, height: u32, surface: *wl.Surface, display: *wl.Display) !VulkanContext {
     var arena = std.heap.ArenaAllocator.init(safe_allocator);
@@ -61,46 +78,37 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         return error.NoSuitableVulkanDevice;
     };
     errdefer device.deinit();
-
-    const swapchain = try Swapchain.init(safe_allocator, width, height, device, vk_surface);
-
-    // Setup command buffers
-    var pool_info = vk.SType(c.VkCommandPoolCreateInfo, .{
-        .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = device.getGraphicsQueueIndex()
+    
+    // Create a render pass
+    // Attachments are dependencies between rendering steps (e.g. textures)
+    var attachment = mem.zeroInit(c.VkAttachmentDescription, .{
+        .format = DEFAULT_FORMAT,
+        .samples = c.VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = c.VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
     });
-    var command_pool: c.VkCommandPool = undefined;
-    try vk.check(c.vkCreateCommandPool(device.logical, &pool_info, null, &command_pool));
-
-    var allocate_info = vk.SType(c.VkCommandBufferAllocateInfo, .{
-        .commandPool = command_pool,
-        .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = @intCast(swapchain.images.len),
+    const attachment_ref = mem.zeroInit(c.VkAttachmentReference, .{ .attachment = 0, .layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
+    var subpass = mem.zeroInit(c.VkSubpassDescription, .{
+        .pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &attachment_ref,
     });
-    var command_buffers = try arena.allocator().alloc(c.VkCommandBuffer, swapchain.images.len);
-    try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, command_buffers.ptr));
-    command_buffers.len = swapchain.images.len;
+    var render_pass_create_info = vk.SType(c.VkRenderPassCreateInfo, .{
+        .attachmentCount = 1,
+        .pAttachments = &attachment,
+        .subpassCount = 1,
+        .pSubpasses = &subpass,
+    });
+    var render_pass: c.VkRenderPass = undefined;
+    try vk.check(c.vkCreateRenderPass(device.logical, &render_pass_create_info, null, &render_pass));
 
-    for (command_buffers, 0..) |command_buffer, i| {
-        var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{});
-        try vk.check(c.vkBeginCommandBuffer(command_buffer, &begin_info));
-        c.vkCmdClearColorImage(command_buffer, swapchain.images[i], c.VK_IMAGE_LAYOUT_GENERAL, &.{ .float32 = .{0, 0, 0, 0} }, 1, &std.mem.zeroInit(c.VkImageSubresourceRange, .{
-            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-        }));
-        try vk.check(c.vkEndCommandBuffer(command_buffer));
-    }
+    const swapchain = try Swapchain.init(safe_allocator, render_pass, width, height, device, vk_surface);
 
-    var semaphore_info = vk.SType(c.VkSemaphoreCreateInfo, .{});
-    var render_complete: c.VkSemaphore = undefined;
-    var present_complete: c.VkSemaphore = undefined;
-    try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, &render_complete));
-    try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, &present_complete));
-
-    // Compile shaders
-    log.info("compiling shaders...", .{});
-
+    // Setup a graphics pipeline
     const vertex_spirv = try vk.compileShader(temp_allocator, .vertex, VERTEX_SHADER_DATA);
     const fragment_spirv = try vk.compileShader(temp_allocator, .fragment, FRAGMENT_SHADER_DATA);
 
@@ -117,7 +125,125 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .pCode = fragment_spirv.ptr,
     }), null, &fragment_shader));
 
-    log.info("finished compiling shaders.", .{});
+    const shader_stages = [_]c.VkPipelineShaderStageCreateInfo {
+        vk.SType(c.VkPipelineShaderStageCreateInfo, .{ .stage = c.VK_SHADER_STAGE_VERTEX_BIT, .module = vertex_shader, .pName = "main" }),
+        vk.SType(c.VkPipelineShaderStageCreateInfo, .{ .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragment_shader, .pName = "main" }),
+    };
+    const vertex_input_info = vk.SType(c.VkPipelineVertexInputStateCreateInfo, .{});
+    const input_assembly_info = vk.SType(c.VkPipelineInputAssemblyStateCreateInfo, .{ .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST });
+    const viewport_info = vk.SType(c.VkPipelineViewportStateCreateInfo, .{
+        .viewportCount = 1,
+        .pViewports = &c.VkViewport {
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(width),
+            .height = @floatFromInt(height),
+            .minDepth = 0,
+            .maxDepth = 1,
+        },
+        // Scissor is maybe not necessary ?
+        .scissorCount = 1,
+        .pScissors = &c.VkRect2D {
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = .{ .height = height, .width = width },
+        },
+    });
+    const raster_info = vk.SType(c.VkPipelineRasterizationStateCreateInfo, .{
+        .polygonMode = c.VK_POLYGON_MODE_FILL,
+        .cullMode = c.VK_CULL_MODE_NONE,
+        .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .lineWidth = 1,
+    });
+    const multisample_info = vk.SType(c.VkPipelineMultisampleStateCreateInfo, .{
+        .rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT,
+        .minSampleShading = 1,
+    });
+    const color_blend_info = vk.SType(c.VkPipelineColorBlendStateCreateInfo, .{
+        .logicOp = c.VK_LOGIC_OP_COPY,
+        .attachmentCount = 1,
+        .pAttachments = &mem.zeroInit(c.VkPipelineColorBlendAttachmentState, .{
+            .colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT | c.VK_COLOR_COMPONENT_G_BIT | c.VK_COLOR_COMPONENT_B_BIT | c.VK_COLOR_COMPONENT_A_BIT,
+        }),
+    });
+
+    const layout_info = vk.SType(c.VkPipelineLayoutCreateInfo, .{});
+    var pipeline_layout: c.VkPipelineLayout = undefined;
+    try vk.check(c.vkCreatePipelineLayout(device.logical, &layout_info, null, &pipeline_layout));
+
+    const pipeline_info = vk.SType(c.VkGraphicsPipelineCreateInfo, .{
+        .stageCount = @intCast(shader_stages.len),
+        .pStages = &shader_stages,
+        .pVertexInputState = &vertex_input_info,
+        .pInputAssemblyState = &input_assembly_info,
+        .pViewportState = &viewport_info,
+        .pRasterizationState = &raster_info,
+        .pMultisampleState = &multisample_info,
+        .pColorBlendState = &color_blend_info,
+        .layout = pipeline_layout,
+        .renderPass = render_pass,
+        .subpass = 0,
+        .basePipelineIndex = -1,
+    });
+
+    var pipeline: c.VkPipeline = undefined;
+    try vk.check(c.vkCreateGraphicsPipelines(device.logical, null, 1, &pipeline_info, null, &pipeline));
+
+    // Setup command buffers
+
+    var pool_info = vk.SType(c.VkCommandPoolCreateInfo, .{
+        .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = device.getGraphicsQueueIndex()
+    });
+    var command_pool: c.VkCommandPool = undefined;
+    try vk.check(c.vkCreateCommandPool(device.logical, &pool_info, null, &command_pool));
+
+    var allocate_info = vk.SType(c.VkCommandBufferAllocateInfo, .{
+        .commandPool = command_pool,
+        .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = @intCast(swapchain.images.len),
+    });
+    var command_buffers = try arena.allocator().alloc(c.VkCommandBuffer, swapchain.images.len);
+    try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, command_buffers.ptr));
+    command_buffers.len = swapchain.images.len;
+
+    var render_pass_begin_info = vk.SType(c.VkRenderPassBeginInfo, .{
+        .renderPass = render_pass,
+        .renderArea = .{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = .{ .width = width, .height = height },
+        },
+        .clearValueCount = 1,
+        .pClearValues = &c.VkClearValue { .color = .{ .float32 = .{0, 0, 0, 0} } },
+    });
+
+    for (command_buffers, 0..) |command_buffer, i| {
+        var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{ .flags = c.VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT });
+        try vk.check(c.vkBeginCommandBuffer(command_buffer, &begin_info));
+
+        render_pass_begin_info.framebuffer = swapchain.framebuffers[i];
+        c.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
+
+        c.vkCmdBindPipeline(command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        c.vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        c.vkCmdEndRenderPass(command_buffer);
+
+        try vk.check(c.vkEndCommandBuffer(command_buffer));
+    }
+
+    var semaphore_info = vk.SType(c.VkSemaphoreCreateInfo, .{});
+    const semaphores = try arena.allocator().alloc(c.VkSemaphore, MAX_FRAMES_IN_FLIGHT * 2);
+    for (semaphores) |*semaphore| {
+        try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, semaphore));
+    }
+    const fences = try arena.allocator().alloc(c.VkFence, MAX_FRAMES_IN_FLIGHT);
+    for (fences) |*fence| {
+        try vk.check(c.vkCreateFence(device.logical, &vk.SType(c.VkFenceCreateInfo, .{ .flags = c.VK_FENCE_CREATE_SIGNALED_BIT }), null, fence));
+    }
+
+    var render_complete: c.VkSemaphore = undefined;
+    var present_complete: c.VkSemaphore = undefined;
+    try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, &render_complete));
+    try vk.check(c.vkCreateSemaphore(device.logical, &semaphore_info, null, &present_complete));
 
     return .{
         .arena = arena,
@@ -130,6 +256,14 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .command_buffers = command_buffers,
         .render_complete = render_complete,
         .present_complete = present_complete,
+        .vertex_shader = vertex_shader,
+        .fragment_shader = fragment_shader,
+        .render_pass = render_pass,
+        .pipeline = pipeline,
+        .pipeline_layout = pipeline_layout,
+        .fences = fences,
+        .semaphores = semaphores,
+        .frame = 0,
     };
 }
 
@@ -137,48 +271,69 @@ pub fn tick(context: *VulkanContext) !void {
     const gq = context.device.getGraphicsQueue();
     const pq = context.device.getPresentQueue();
 
+    const RENDER = 0;
+    const PRESENT = 1;
+    const semaphore_pair = context.semaphores[context.frame * 2..];
+
+    try vk.check(c.vkWaitForFences(context.device.logical, 1, &context.fences[context.frame], c.VK_TRUE, std.math.maxInt(u64)));
+    try vk.check(c.vkResetFences(context.device.logical, 1, &context.fences[context.frame]));
+
     var image_index: u32 = undefined;
-    try vk.check(c.vkAcquireNextImageKHR(context.device.logical, context.swapchain.handle, std.math.maxInt(u32), context.present_complete, null, &image_index));
+    try vk.check(c.vkAcquireNextImageKHR(context.device.logical, context.swapchain.handle, std.math.maxInt(u32), semaphore_pair[PRESENT], null, &image_index));
 
     var submit_info = vk.SType(c.VkSubmitInfo, .{
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &context.present_complete,
+        .pWaitSemaphores = &semaphore_pair[PRESENT],
         .pWaitDstStageMask = &@as(u32, c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT),
         .commandBufferCount = 1,
         .pCommandBuffers = &context.command_buffers[image_index],
         .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &context.render_complete,
+        .pSignalSemaphores = &semaphore_pair[RENDER],
     });
-    try vk.check(c.vkQueueSubmit(gq, 1, &submit_info, null));
+    try vk.check(c.vkQueueSubmit(gq, 1, &submit_info, context.fences[context.frame]));
 
     var present_info = vk.SType(c.VkPresentInfoKHR, .{
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &context.render_complete,
+        .pWaitSemaphores = &semaphore_pair[RENDER],
         .swapchainCount = 1,
         .pSwapchains = &context.swapchain.handle,
         .pImageIndices = &image_index,
     });
     try vk.check(c.vkQueuePresentKHR(pq, &present_info));
+
+    context.frame = (context.frame + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 
 pub fn deinit(context: VulkanContext) void {
-    c.vkDestroySemaphore(context.device.logical, context.render_complete, null);
-    c.vkDestroySemaphore(context.device.logical, context.present_complete, null);
+    c.vkDestroySurfaceKHR(context.instance, context.surface, null);
+    c.vkDestroyShaderModule(context.device.logical, context.vertex_shader, null);
+    c.vkDestroyShaderModule(context.device.logical, context.fragment_shader, null);
+    for (context.semaphores) |semaphore| {
+        c.vkDestroySemaphore(context.device.logical, semaphore, null);
+    }
+    for (context.fences) |fence| {
+        c.vkDestroyFence(context.device.logical, fence, null);
+    }
     c.vkFreeCommandBuffers(context.device.logical, context.command_pool, @intCast(context.command_buffers.len), context.command_buffers.ptr);
     c.vkDestroyCommandPool(context.device.logical, context.command_pool, null);
     context.swapchain.deinit(context);
+    c.vkDestroyPipelineLayout(context.device.logical, context.pipeline_layout, null);
+    c.vkDestroyPipeline(context.device.logical, context.pipeline, null);
+    c.vkDestroyRenderPass(context.device.logical, context.render_pass, null);
     context.device.deinit();
 }
 
-// This is separated from the context directly so that in the future we can separate the lifetime with its own arena
+// This is separated from the context directly so that in the future we can separate the lifetime with its own arena.
+// This struct stores things that are depended on by the swapchain so that when you re-create a swapchain you also re-create those.
 const Swapchain = struct {
     arena: std.heap.ArenaAllocator, // for allocators that share the lifetime of the VulkanContext (usually static lifetime)
     handle: c.VkSwapchainKHR,
     images: []c.VkImage,
     views: []c.VkImageView,
+    framebuffers: []c.VkFramebuffer, // I know that storing the framebuffers here may be a bit strange, but they do depend on the image views
     surface_caps: c.VkSurfaceCapabilitiesKHR,
 
-    pub fn init(safe_allocator: std.mem.Allocator, width: u32, height: u32, device: Device, surface: c.VkSurfaceKHR) !Swapchain {
+    pub fn init(safe_allocator: std.mem.Allocator, render_pass: c.VkRenderPass, width: u32, height: u32, device: Device, surface: c.VkSurfaceKHR) !Swapchain {
         var arena = std.heap.ArenaAllocator.init(safe_allocator);
         errdefer arena.deinit();
 
@@ -189,11 +344,11 @@ const Swapchain = struct {
         var swapchain_create_info = vk.SType(c.VkSwapchainCreateInfoKHR, .{
             .surface = surface,
             .minImageCount = surface_caps.minImageCount,
-            .imageFormat = c.VK_FORMAT_R8G8B8A8_UNORM,
-            .imageColorSpace = c.VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            .imageFormat = DEFAULT_FORMAT,
+            .imageColorSpace = DEFAULT_COLORSPACE,
             .imageExtent = .{ .width = width, .height = height },
             .imageArrayLayers = 1,
-            .imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | c.VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .presentMode = c.VK_PRESENT_MODE_FIFO_KHR,
             .preTransform = surface_caps.currentTransform,
             .compositeAlpha = c.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
@@ -226,32 +381,50 @@ const Swapchain = struct {
         try vk.check(c.vkGetSwapchainImagesKHR(device.logical, swapchain, &swapchain_images_count, swapchain_images.ptr));
         swapchain_images.len = swapchain_images_count;
 
+        var image_view_create_info = vk.SType(c.VkImageViewCreateInfo, .{
+            .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+            .format = swapchain_create_info.imageFormat,
+            .subresourceRange = .{
+                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        });
         var image_views = try arena.allocator().alloc(c.VkImageView, swapchain_images_count);
         for (swapchain_images, 0..) |image, i| {
-            var image_view_create_info = vk.SType(c.VkImageViewCreateInfo, .{
-                .image = image,
-                .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
-                .format = swapchain_create_info.imageFormat,
-                .subresourceRange = .{
-                    .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-                    .levelCount = 1,
-                    .layerCount = 1,
-                },
-            });
+            image_view_create_info.image = image;
             try vk.check(c.vkCreateImageView(device.logical, &image_view_create_info, null, &image_views[i]));
         }
         image_views.len = swapchain_images_count;
+
+        var framebuffer_create_info = vk.SType(c.VkFramebufferCreateInfo, .{
+            .renderPass = render_pass,
+            .attachmentCount = 1,
+            .width = width,
+            .height = height,
+            .layers = 1,
+        });
+        var framebuffers = try arena.allocator().alloc(c.VkFramebuffer, swapchain_images_count);
+        for (0..swapchain_images_count) |i| {
+            framebuffer_create_info.pAttachments = &image_views[i];
+            try vk.check(c.vkCreateFramebuffer(device.logical, &framebuffer_create_info, null, &framebuffers[i]));
+        }
+        framebuffers.len = swapchain_images_count;
 
         return .{
             .arena = arena,
             .handle = swapchain,
             .images = swapchain_images,
             .views = image_views,
+            .framebuffers = framebuffers,
             .surface_caps = surface_caps,
         };
     }
 
     pub fn deinit(swapchain: Swapchain, context: VulkanContext) void {
+        for (swapchain.framebuffers) |framebuffer| {
+            c.vkDestroyFramebuffer(context.device.logical, framebuffer, null);
+        }
         for (swapchain.views) |view| {
             c.vkDestroyImageView(context.device.logical, view, null);
         }
