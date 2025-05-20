@@ -12,6 +12,7 @@ const Device = @import("device.zig");
 const Vert = mesh.Vert;
 const Verts = mesh.Verts;
 const Mesh = mesh.Mesh;
+const VertexBuffer = mesh.VertexBuffer;
 
 const c = @import("c.zig").includes;
 
@@ -152,6 +153,7 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
 
     const swapchain = try Swapchain.init(safe_allocator, render_pass, width, height, device, vk_surface);
 
+    var push: [6]f32 = undefined;
     const object = object: {
         var pool_info = vk.SType(c.VkCommandPoolCreateInfo, .{
             .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -170,16 +172,22 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, &copy_cmdbuf));
         defer c.vkFreeCommandBuffers(device.logical, command_pool, 1, &copy_cmdbuf);
 
-        // const cube = zmesh.Shape.initCube();
-        // defer cube.deinit();
+        var shape = zmesh.Shape.initCube();
+        // Changes the coordanites to be in -1..1 range, not 0..1 range
+        shape.scale(2, 2, 1);
+        shape.translate(-1, -1, 0);
+ 
+        push = shape.computeAabb();
 
-        const verts = try Verts.with(safe_allocator, &.{
-            Vert.of(.{.{-1, 1, 0}, .{1, 0}}),
-            Vert.of(.{.{0, -1, 0}, .{0, 1}}),
-            Vert.of(.{.{1, 1, 0}, .{1, 1}}),
+        shape.computeNormals();
+        defer shape.deinit();
+
+        break :object try Mesh.init(device, copy_cmdbuf, .{
+            .indices = shape.indices,
+            .positions = shape.positions,
+            .normals = shape.normals,
+            .texcoords = shape.texcoords,
         });
-        defer verts.deinit();
-        break :object try Mesh.init(device, copy_cmdbuf, verts);
     };
 
     // Setup a graphics pipeline
@@ -204,29 +212,23 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         vk.SType(c.VkPipelineShaderStageCreateInfo, .{ .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT, .module = fragment_shader, .pName = "main" }),
     };
 
-    const VertexBindings = std.enums.EnumArray(std.meta.FieldEnum(Vert), c.VkVertexInputBindingDescription);
-    var vertex_bindings = VertexBindings.initUndefined();
-    inline for (comptime std.meta.tags(std.meta.FieldEnum(Vert))) |field| {
-        vertex_bindings.set(field, .{ .binding = @intCast(VertexBindings.Indexer.indexOf(field)), .stride = @sizeOf(@FieldType(Vert, @tagName(field))), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX });
+    var vertex_bindings: [VertexBuffer.Bindings.len]c.VkVertexInputBindingDescription = undefined;
+    inline for (VertexBuffer.Bindings, 0..) |binding, i| {
+        vertex_bindings[i] =
+            .{ .binding = i, .stride = @intCast(VertexBuffer.sizeOf(binding)), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX };
     }
 
-    const field_to_vktype = std.enums.EnumMap(std.meta.FieldEnum(Vert), c.VkFormat).init(.{
-        .position = c.VK_FORMAT_R32G32B32_SFLOAT,
-        .texel = c.VK_FORMAT_R32G32_SFLOAT,
-    });
-
-    const VertexAttrs = std.enums.EnumArray(std.meta.FieldEnum(Vert), c.VkVertexInputAttributeDescription);
-    var vertex_attrs = VertexAttrs.initUndefined();
-    inline for (comptime std.meta.tags(std.meta.FieldEnum(Vert))) |field| {
-        const index = VertexAttrs.Indexer.indexOf(field);
-        vertex_attrs.set(field, .{ .binding = @intCast(index), .location = @intCast(index), .format = field_to_vktype.get(field).?, .offset = 0 });
+    var vertex_attrs: [VertexBuffer.Bindings.len]c.VkVertexInputAttributeDescription = undefined;
+    inline for (VertexBuffer.Bindings, 0..) |binding, i| {
+        vertex_attrs[i] =
+            .{ .binding = i, .location = i, .format = @field(VertexBuffer.binding_type, @tagName(binding)), .offset = 0 };
     }
 
     const vertex_input_info = vk.SType(c.VkPipelineVertexInputStateCreateInfo, .{
-        .vertexBindingDescriptionCount = vertex_bindings.values.len,
-        .pVertexBindingDescriptions = &vertex_bindings.values,
-        .vertexAttributeDescriptionCount = vertex_attrs.values.len,
-        .pVertexAttributeDescriptions = &vertex_attrs.values,
+        .vertexBindingDescriptionCount = vertex_bindings.len,
+        .pVertexBindingDescriptions = &vertex_bindings,
+        .vertexAttributeDescriptionCount = vertex_attrs.len,
+        .pVertexAttributeDescriptions = &vertex_attrs,
     });
     const input_assembly_info = vk.SType(c.VkPipelineInputAssemblyStateCreateInfo, .{ .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST });
     const viewport_info = vk.SType(c.VkPipelineViewportStateCreateInfo, .{
@@ -264,8 +266,8 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
     });
 
     const layout_info = vk.SType(c.VkPipelineLayoutCreateInfo, .{
-        .setLayoutCount = 0,
-        .pSetLayouts = null,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &.{ .offset = 0, .size = @sizeOf([6]f32), .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT },
     });
     var pipeline_layout: c.VkPipelineLayout = undefined;
     try vk.check(c.vkCreatePipelineLayout(device.logical, &layout_info, null, &pipeline_layout));
@@ -316,33 +318,6 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .pClearValues = &c.VkClearValue { .color = .{ .float32 = .{0, 0, 0, 0} } },
     });
 
-    // Bind vertex data
-    // {
-    //     const pool_info_ = vk.SType(c.VkCommandPoolCreateInfo, .{
-    //         .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-    //         .queueFamilyIndex = device.getGraphicsQueueIndex()
-    //     });
-    //     var command_pool_: c.VkCommandPool = undefined;
-    //     try vk.check(c.vkCreateCommandPool(device.logical, &pool_info_, null, &command_pool_));
-    //     defer c.vkDestroyCommandPool(device.logical, command_pool_, null);
-    //     var vertex_cmdbuf: c.VkCommandBuffer = undefined;
-    //     try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, &vertex_cmdbuf));
-    //
-    //     var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{ .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT });
-    //     try vk.check(c.vkBeginCommandBuffer(vertex_cmdbuf, &begin_info));
-    //     std.debug.print("foo: {any}\n", .{object.buffers.values});
-    //     c.vkCmdBindVertexBuffers(vertex_cmdbuf, 0, 2, &object.buffers.values, &std.mem.zeroes([object.buffers.values.len]u64));
-    //     try vk.check(c.vkEndCommandBuffer(vertex_cmdbuf));
-    //
-    //     const gq = device.getGraphicsQueue();
-    //     var submit_info = vk.SType(c.VkSubmitInfo, .{
-    //         .commandBufferCount = 1,
-    //         .pCommandBuffers = &vertex_cmdbuf,
-    //     });
-    //     try vk.check(c.vkQueueSubmit(gq, 1, &submit_info, null));
-    //     try vk.check(c.vkQueueWaitIdle(gq));
-    // }
-
     for (command_buffers, 0..) |command_buffer, i| {
         var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{ .flags = c.VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT });
         try vk.check(c.vkBeginCommandBuffer(command_buffer, &begin_info));
@@ -350,8 +325,11 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         render_pass_begin_info.framebuffer = swapchain.framebuffers[i];
         c.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
         c.vkCmdBindPipeline(command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        c.vkCmdBindVertexBuffers(command_buffer, 0, 2, &object.buffers.values, &std.mem.zeroes([object.buffers.values.len]u64));
-        c.vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        const vertex_data = object.buffers.values[VertexBuffer.Index.indices.ord() + 1..];
+        c.vkCmdPushConstants(command_buffer, pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf([6]f32), &push);
+        c.vkCmdBindIndexBuffer(command_buffer, object.buffers.get(.indices), 0, c.VK_INDEX_TYPE_UINT32);
+        c.vkCmdBindVertexBuffers(command_buffer, 0, VertexBuffer.Bindings.len, vertex_data.ptr, &std.mem.zeroes([VertexBuffer.Bindings.len]u64));
+        c.vkCmdDrawIndexed(command_buffer, @intCast(object.sizes.get(.indices) / VertexBuffer.sizeOf(.indices)), 1, 0, 0, 0);
         c.vkCmdEndRenderPass(command_buffer);
 
         try vk.check(c.vkEndCommandBuffer(command_buffer));

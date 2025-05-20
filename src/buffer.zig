@@ -3,6 +3,8 @@ const std = @import("std");
 const vk = @import("vk.zig");
 const Device = @import("device.zig");
 
+const zm = @import("zmath");
+
 const c = @import("c.zig").includes;
 
 pub const Memory = struct {
@@ -106,139 +108,39 @@ pub const Memory = struct {
     }
 };
 
-// pub const Buffer = struct {
-//     handle: c.VkBuffer,
-//     memory: c.VkMemory,
-//     capacity: usize,
-//
-//     pub fn init(device: Device, capacity: usize, usage: c.VkBufferUsageFlags, memory_props: c.VkMemoryPropertyFlags) !Buffer {
-//         var result: Buffer = undefined;
-//
-//         var buffer_info = vk.SType(c.VkBufferCreateInfo, .{
-//             .size = capacity,
-//             .usage = usage,
-//             .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
-//         });
-//         try vk.check(c.vkCreateBuffer(device.logical, &buffer_info, null, &result.handle));
-//
-//         var memory_reqs: c.VkMemoryRequirements  = undefined;
-//         c.vkGetBufferMemoryRequirements(device.logical, buffer, &memory_reqs);
-//
-//         result.capacity = memory_reqs.size;
-//
-//         const Set = std.bit_set.IntegerBitSet(32);
-//         var type_bits = Set { .mask = memory_reqs.memoryTypeBits };
-//         var prop_bits = Set { .mask = memory_props };
-//         const memory_types = device.memory_props.memoryTypes[0..device.memory_props.memoryTypeCount];
-//         const type_index = for (memory_types, 0..) |memory_type, i| {
-//             if (type_bits.isSet(i) and prop_bits.eql(.{ .mask = memory_type.propertyFlags })) {
-//                 break i;
-//             }
-//         };
-//
-//         var alloc_info = vk.SType(c.VkMemoryAllocateInfo, .{
-//             .allocationSize = capacity,
-//             .memoryTypeIndex = type_index,
-//         });
-//         try vk.check(c.vkAllocateMemory(device, &alloc_info, null, &result.memory));
-//         try vk.check(c.vkBindBufferMemory(device, buffer, result.memory, 0));
-//
-//         return result;
-//     }
-//
-//     pub fn ensureCapacity(buf: *Buffer, capacity: usize) !void {
-//         if (capacity > buf.capacity) {
-//             c.
-//         }
-//     }
-//
-//     pub fn deinit(device: c.VkDevice, buf: Buffer) void {
-//         c.vkDestroyBuffer(device, buf.handle, null);
-//         c.vkFreeMemory(device, buf.memory, null);
-//     }
-// };
+pub const UniformBufferData = struct {
+    projection: zm.Mat,
+};
 
-// pub fn HandlePool(comptime T: type) type {
-//     return struct {
-//         const Pool = @This();
-//         const Handle = usize;
-//         const Node = struct {
-//             block: Handle,
-//             next: ?*Node,
-//         };
-//
-//         const Block = union(enum) {
-//             vacant: void,
-//             uninit: void,
-//             init: T,
-//         };
-//
-//         arena: std.heap.ArenaAllocator,
-//         blocks: []Block,
-//         capacity: usize = 0,
-//         free_list: ?*Node,
-//
-//         pub fn initCapacity(allocator: std.mem.Allocator, num: usize) !Pool {
-//             if (num == 0) return error.InvalidSize;
-//
-//             var result: Pool = undefined;
-//
-//             result.arena = std.heap.ArenaAllocator.init(allocator);
-//             result.blocks = try result.arena.allocator().alloc(T, num);
-//             @memset(result.blocks, .vacant);
-//             result.capacity = num;
-//             result.free_list = try result.arena.allocator().create(Node);
-//             result.free_list.?.block = 0;
-//             result.free_list.?.next = null;
-//
-//             result.updateFreeList(0);
-//
-//             return result;
-//         }
-//
-//         fn updateFreeList(pool: *Pool, old_capacity: usize) !void {
-//             // find the end of the free list
-//             var node_ptr = pool.free_list;
-//             while (node_ptr.next != null) node_ptr = node_ptr.?.next;
-//
-//             for (old_capacity..pool.capacity) |i| {
-//                 node_ptr.next = try pool.arena.allocator().create(Node);
-//                 node_ptr.next.block = i;
-//                 node_ptr = node_ptr.next;
-//                 node_ptr.next = null;
-//             }
-//         }
-//
-//         pub fn create(pool: *Pool) Handle {
-//             if (pool.free_list) |free_list| {
-//                 const block = free_list.block;
-//                 pool.free_list = free_list.next;
-//                 pool.arena.allocator().destroy(free_list);
-//                 return block;
-//             }
-//
-//             const block = pool.capacity;
-//             pool.capacity *= 2;
-//             pool.blocks = try pool.arena.allocator().realloc(pool.blocks, pool.capacity);
-//             @memset(pool.blocks[block..], .vacant);
-//             try pool.updateFreeList(block);
-//
-//             return block;
-//         }
-//
-//         pub fn destroy(pool: *Pool, block: Handle) !void {
-//             var new_node = try pool.arena.allocator().create(Node);
-//             new_node.block = block;
-//             new_node.next = pool.free_list;
-//             pool.free_list = new_node;
-//         }
-//
-//         pub fn get(pool: *Pool, block: Handle) *Block {
-//             return &pool.blocks[block];
-//         }
-//
-//         pub fn deinit(pool: Pool) void {
-//             pool.arena.deinit();
-//         }
-//     };
-// }
+pub const UniformBuffer = struct {
+    device: Device,
+    buffer: c.VkBuffer,
+    memory: Memory,
+
+    pub fn init(device: Device) !UniformBuffer {
+        var buffer_info = vk.SType(c.VkBufferCreateInfo, .{
+            .size = @sizeOf(UniformBufferData),
+            .usage = c.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        });
+        var buffer: c.VkBuffer = undefined;
+        try vk.check(c.vkCreateBuffer(device.logical, &buffer_info, null, &buffer));
+        const memory = try Memory.fromBufs(device, @as([*]c.VkBuffer, &buffer)[0..1], c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        return .{
+            .device = device,
+            .buffer = buffer,
+            .memory = memory,
+        };
+    }
+
+    pub fn update(ub: UniformBuffer, data: UniformBufferData) void {
+        const view = ub.memory.map(@sizeOf(data));
+        defer ub.memory.unmap();
+        @memcpy(view, @as([*]u8, @ptrCast(&data))[0..view.len]);
+    }
+
+    pub fn deinit(ub: UniformBuffer) void {
+        ub.memory.deinit();
+        c.vkDestroyBuffer(ub.device.logical, ub.buffer, null);
+    }
+};

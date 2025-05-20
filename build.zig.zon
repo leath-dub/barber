@@ -15,6 +15,10 @@
             .url = "https://github.com/zig-gamedev/zmesh/archive/f8f528128704ae879a16ddb0a3470c5e0a144a20.tar.gz",
             .hash = "zmesh-0.11.0-dev-oO3A5gx7CgCBPHsGeuNzwzXAyEvs57u39AD5EUZTScli",
         },
+        .zmath = .{
+            .url = "https://github.com/zig-gamedev/zmath/archive/1745b6a7a4b9d275c4c948fbbb03568b8c72617d.tar.gz",
+            .hash = "zmath-0.11.0-dev-wjwiva80AwAYXBoySNnvX3FiQqrs8TcupymM9pHauLbN",
+        },
     },
     .fingerprint = 0x7c48a9a4c867c82f,
 }

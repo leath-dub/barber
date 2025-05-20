@@ -98,9 +98,9 @@ pub fn main() !void {
 
     // Initial configuration of the status bar
     layer_surface.setAnchor(.{ .top = true, .left = true, .right = true, .bottom = false });
-    layer_surface.setExclusiveZone(20);
+    layer_surface.setExclusiveZone(50);
     // layer_surface.setMargin(10, 10, 10, 10);
-    layer_surface.setSize(0, 20);
+    layer_surface.setSize(0, 50);
     surface.commit();
 
     layer_surface.setListener(*Context, layerSurfaceListener, &context);
