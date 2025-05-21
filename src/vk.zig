@@ -3,6 +3,9 @@
 const std = @import("std");
 const mem = std.mem;
 const log = std.log;
+const ascii = std.ascii;
+const meta = std.meta;
+const builtin = std.builtin;
 
 const c = @import("c.zig").includes;
 
@@ -113,6 +116,82 @@ pub fn compileShader(allocator: mem.Allocator, stage: ShaderStage, glslText: [*:
     }
 
     return spirv;
+}
+
+pub fn descriptorPool(device: c.VkDevice, maxSets: u32, comptime sizes: []const meta.Tuple(&.{Enum(.descriptor_type), u32})) !c.VkDescriptorPool {
+    var descriptor_sizes: [sizes.len]c.VkDescriptorPoolSize = undefined;
+    inline for (sizes, 0..) |size, i| {
+        descriptor_sizes[i] = .{ .type = @intFromEnum(size.@"0"), .descriptorCount = size.@"1" };
+    }
+    const pool_info = SType(c.VkDescriptorPoolCreateInfo, .{
+        .maxSets = maxSets,
+        .poolSizeCount = descriptor_sizes.len,
+        .pPoolSizes = &descriptor_sizes,
+    });
+    var pool: c.VkDescriptorPool = undefined;
+    try check(c.vkCreateDescriptorPool(device, &pool_info, null, &pool));
+    return pool;
+}
+
+pub fn binding(at: u32, dtype: Enum(.descriptor_type), dcount: u32, stage: Enum(.shader_stage), samplers: ?[]const c.VkSampler) c.VkDescriptorSetLayoutBinding {
+    const samplers_ptr = if (samplers) |samplers_| samplers_.ptr else null;
+    return .{
+        .binding = at,
+        .descriptorType = @intCast(@intFromEnum(dtype)),
+        .descriptorCount = dcount,
+        .stageFlags = @intCast(@intFromEnum(stage)),
+        .pImmutableSamplers = samplers_ptr,
+    };
+}
+
+pub fn Enum(comptime ns: @Type(.enum_literal)) type {
+    var upper_ns_data: [@tagName(ns).len]u8 = undefined;
+    const upper_ns = ascii.upperString(upper_ns_data[0..], @tagName(ns));
+    const prefix = "VK_" ++ upper_ns;
+
+    var field_data: [meta.declarations(c).len]builtin.Type.EnumField = undefined;
+    var field_count: usize = 0;
+
+    @setEvalBranchQuota(std.math.maxInt(u32));
+
+    inline for (comptime meta.declarations(c)) |decl| {
+        if (mem.startsWith(u8, decl.name, prefix)) {
+            const field_lower: [:0]u8 = comptime field: {
+                const field = decl.name[prefix.len + 1..];
+                var field_lower_data: [field.len + 1:0]u8 = undefined;
+                @memset(field_lower_data[0..], 0);
+                break :field @ptrCast(ascii.lowerString(field_lower_data[0..], field));
+            };
+
+            // Check that the field is not already set
+            const already_exists = out: {
+                inline for (field_data[0..field_count]) |field| {
+                    if (field.value == @field(c, decl.name)) {
+                        break :out true;
+                    }
+                }
+                break :out false;
+            };
+
+            if (!already_exists) {
+                field_data[field_count] = .{
+                    .name = field_lower,
+                    .value = @field(c, decl.name),
+                };
+                field_count += 1;
+            }
+        }
+    }
+
+    const fields = field_data[0..field_count];
+    return @Type(builtin.Type {
+        .@"enum" = .{
+            .tag_type = c_int,
+            .decls = &.{},
+            .fields = fields,
+            .is_exhaustive = true,
+        }
+    });
 }
 
 const Result = enum(c_int) {

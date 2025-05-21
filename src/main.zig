@@ -105,8 +105,10 @@ pub fn main() !void {
 
     layer_surface.setListener(*Context, layerSurfaceListener, &context);
 
+    var timer = try std.time.Timer.start();
+
     while (display.dispatch() == .SUCCESS) {
-        try context.backend.?.tick();
+        try context.backend.?.tick(timer.lap());
         _ = display.flush();
         _ = arena_allocator.reset(.{ .retain_with_limit = 8192 });
     }

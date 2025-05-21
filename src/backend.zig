@@ -9,6 +9,7 @@ const wl = wayland.client.wl;
 const vk = @import("vk.zig");
 const mesh = @import("mesh.zig");
 const Device = @import("device.zig");
+const UniformBuffer = @import("buffer.zig").UniformBuffer;
 const Vert = mesh.Vert;
 const Verts = mesh.Verts;
 const Mesh = mesh.Mesh;
@@ -29,13 +30,18 @@ device: Device,
 swapchain: Swapchain,
 
 command_pool: c.VkCommandPool,
-command_buffers: []c.VkCommandBuffer,
+primary_commands: []c.VkCommandBuffer,
+secondary_commands: []c.VkCommandBuffer,
 render_complete: c.VkSemaphore,
 present_complete: c.VkSemaphore,
 
 vertex_shader: c.VkShaderModule,
 fragment_shader: c.VkShaderModule,
 
+uniform_buffer: UniformBuffer,
+descriptor_pool: c.VkDescriptorPool,
+uniform_buffer_layout: c.VkDescriptorSetLayout,
+uniform_buffer_set: c.VkDescriptorSet,
 render_pass: c.VkRenderPass,
 pipeline: c.VkPipeline,
 pipeline_layout: c.VkPipelineLayout,
@@ -107,7 +113,6 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
 
     const vkCreateDebugUtilsMessengerEXT: c.PFN_vkCreateDebugUtilsMessengerEXT = @ptrCast(c.vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
     try vk.check(vkCreateDebugUtilsMessengerEXT.?(instance, &debug_utils_info, null, &messenger));
- 
 
     const surface_create_info = vk.SType(c.VkWaylandSurfaceCreateInfoKHR, .{
         .display = @ptrCast(display),
@@ -153,7 +158,6 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
 
     const swapchain = try Swapchain.init(safe_allocator, render_pass, width, height, device, vk_surface);
 
-    var push: [6]f32 = undefined;
     const object = object: {
         var pool_info = vk.SType(c.VkCommandPoolCreateInfo, .{
             .flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -172,13 +176,8 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, &copy_cmdbuf));
         defer c.vkFreeCommandBuffers(device.logical, command_pool, 1, &copy_cmdbuf);
 
+        // var shape = zmesh.Shape.initTorus(20, 20, 0.5);
         var shape = zmesh.Shape.initCube();
-        // Changes the coordanites to be in -1..1 range, not 0..1 range
-        shape.scale(2, 2, 1);
-        shape.translate(-1, -1, 0);
- 
-        push = shape.computeAabb();
-
         shape.computeNormals();
         defer shape.deinit();
 
@@ -248,8 +247,8 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         },
     });
     const raster_info = vk.SType(c.VkPipelineRasterizationStateCreateInfo, .{
-        .polygonMode = c.VK_POLYGON_MODE_FILL,
-        .cullMode = c.VK_CULL_MODE_NONE,
+        .polygonMode = c.VK_POLYGON_MODE_LINE,
+        .cullMode = c.VK_CULL_MODE_BACK_BIT,
         .frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE,
         .lineWidth = 1,
     });
@@ -265,9 +264,45 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         }),
     });
 
+    var uniform_buffer = try UniformBuffer.init(device);
+    try uniform_buffer.update(UniformBuffer.Data.default(@as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height))));
+
+    var descriptor_pool: c.VkDescriptorPool = undefined;
+    var uniform_buffer_layout: c.VkDescriptorSetLayout = undefined;
+    var uniform_buffer_set: c.VkDescriptorSet = undefined;
+    {
+        descriptor_pool = try vk.descriptorPool(device.logical, 1, &.{ .{ .uniform_buffer, 1 } });
+        const set_layout_info = vk.SType(c.VkDescriptorSetLayoutCreateInfo, .{
+            .bindingCount = 1,
+            .pBindings = &vk.binding(0, .uniform_buffer, 1, .vertex_bit, null),
+        });
+        try vk.check(c.vkCreateDescriptorSetLayout(device.logical, &set_layout_info, null, &uniform_buffer_layout));
+
+        const alloc_info = vk.SType(c.VkDescriptorSetAllocateInfo, .{
+            .descriptorPool = descriptor_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &uniform_buffer_layout,
+        });
+        try vk.check(c.vkAllocateDescriptorSets(device.logical, &alloc_info, &uniform_buffer_set));
+
+        const descriptor_write = vk.SType(c.VkWriteDescriptorSet, .{
+            .dstSet = uniform_buffer_set,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorType = @intFromEnum(vk.Enum(.descriptor_type).uniform_buffer),
+            .descriptorCount = 1,
+            .pBufferInfo = &c.VkDescriptorBufferInfo {
+                .buffer = uniform_buffer.buffer,
+                .offset = 0,
+                .range = @sizeOf(UniformBuffer.Data),
+            },
+        });
+        c.vkUpdateDescriptorSets(device.logical, 1, &descriptor_write, 0, null);
+    }
+
     const layout_info = vk.SType(c.VkPipelineLayoutCreateInfo, .{
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &.{ .offset = 0, .size = @sizeOf([6]f32), .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT },
+        .setLayoutCount = 1,
+        .pSetLayouts = &uniform_buffer_layout,
     });
     var pipeline_layout: c.VkPipelineLayout = undefined;
     try vk.check(c.vkCreatePipelineLayout(device.logical, &layout_info, null, &pipeline_layout));
@@ -299,14 +334,27 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
     var command_pool: c.VkCommandPool = undefined;
     try vk.check(c.vkCreateCommandPool(device.logical, &pool_info, null, &command_pool));
 
-    var allocate_info = vk.SType(c.VkCommandBufferAllocateInfo, .{
-        .commandPool = command_pool,
-        .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = @intCast(swapchain.images.len),
-    });
-    var command_buffers = try arena.allocator().alloc(c.VkCommandBuffer, swapchain.images.len);
-    try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, command_buffers.ptr));
-    command_buffers.len = swapchain.images.len;
+    var secondary_commands = try arena.allocator().alloc(c.VkCommandBuffer, swapchain.images.len);
+    {
+        var allocate_info = vk.SType(c.VkCommandBufferAllocateInfo, .{
+            .commandPool = command_pool,
+            .level = c.VK_COMMAND_BUFFER_LEVEL_SECONDARY,
+            .commandBufferCount = @intCast(swapchain.images.len),
+        });
+        try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, secondary_commands.ptr));
+        secondary_commands.len = swapchain.images.len;
+    }
+
+    var primary_commands = try arena.allocator().alloc(c.VkCommandBuffer, swapchain.images.len);
+    {
+        var allocate_info = vk.SType(c.VkCommandBufferAllocateInfo, .{
+            .commandPool = command_pool,
+            .level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = @intCast(swapchain.images.len),
+        });
+        try vk.check(c.vkAllocateCommandBuffers(device.logical, &allocate_info, primary_commands.ptr));
+        primary_commands.len = swapchain.images.len;
+    }
 
     var render_pass_begin_info = vk.SType(c.VkRenderPassBeginInfo, .{
         .renderPass = render_pass,
@@ -318,21 +366,24 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .pClearValues = &c.VkClearValue { .color = .{ .float32 = .{0, 0, 0, 0} } },
     });
 
-    for (command_buffers, 0..) |command_buffer, i| {
+    for (primary_commands, 0..) |primary_buffer, i| {
         var begin_info = vk.SType(c.VkCommandBufferBeginInfo, .{ .flags = c.VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT });
-        try vk.check(c.vkBeginCommandBuffer(command_buffer, &begin_info));
+        try vk.check(c.vkBeginCommandBuffer(primary_buffer, &begin_info));
 
         render_pass_begin_info.framebuffer = swapchain.framebuffers[i];
-        c.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
-        c.vkCmdBindPipeline(command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        const vertex_data = object.buffers.values[VertexBuffer.Index.indices.ord() + 1..];
-        c.vkCmdPushConstants(command_buffer, pipeline_layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf([6]f32), &push);
-        c.vkCmdBindIndexBuffer(command_buffer, object.buffers.get(.indices), 0, c.VK_INDEX_TYPE_UINT32);
-        c.vkCmdBindVertexBuffers(command_buffer, 0, VertexBuffer.Bindings.len, vertex_data.ptr, &std.mem.zeroes([VertexBuffer.Bindings.len]u64));
-        c.vkCmdDrawIndexed(command_buffer, @intCast(object.sizes.get(.indices) / VertexBuffer.sizeOf(.indices)), 1, 0, 0, 0);
-        c.vkCmdEndRenderPass(command_buffer);
+        c.vkCmdBeginRenderPass(primary_buffer, &render_pass_begin_info, c.VK_SUBPASS_CONTENTS_INLINE);
 
-        try vk.check(c.vkEndCommandBuffer(command_buffer));
+        c.vkCmdBindPipeline(primary_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        c.vkCmdBindDescriptorSets(primary_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &uniform_buffer_set, 0, null);
+
+        const vertex_data = object.buffers.values[VertexBuffer.Index.indices.ord() + 1..];
+        c.vkCmdBindIndexBuffer(primary_buffer, object.buffers.get(.indices), 0, c.VK_INDEX_TYPE_UINT32);
+        c.vkCmdBindVertexBuffers(primary_buffer, 0, VertexBuffer.Bindings.len, vertex_data.ptr, &std.mem.zeroes([VertexBuffer.Bindings.len]u64));
+        c.vkCmdDrawIndexed(primary_buffer, @intCast(object.sizes.get(.indices) / VertexBuffer.sizeOf(.indices)), 1, 0, 0, 0);
+
+        c.vkCmdEndRenderPass(primary_buffer);
+
+        try vk.check(c.vkEndCommandBuffer(primary_buffer));
     }
 
     var semaphore_info = vk.SType(c.VkSemaphoreCreateInfo, .{});
@@ -358,7 +409,8 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .device = device,
         .swapchain = swapchain,
         .command_pool = command_pool,
-        .command_buffers = command_buffers,
+        .primary_commands = primary_commands,
+        .secondary_commands = secondary_commands,
         .render_complete = render_complete,
         .present_complete = present_complete,
         .vertex_shader = vertex_shader,
@@ -371,10 +423,14 @@ pub fn init(safe_allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator
         .frame = 0,
         .object = object,
         .messenger = messenger,
+        .descriptor_pool = descriptor_pool,
+        .uniform_buffer_layout = uniform_buffer_layout,
+        .uniform_buffer_set = uniform_buffer_set,
+        .uniform_buffer = uniform_buffer,
     };
 }
 
-pub fn tick(context: *VulkanContext) !void {
+pub fn tick(context: *VulkanContext, _: u64) !void {
     const gq = context.device.getGraphicsQueue();
     const pq = context.device.getPresentQueue();
 
@@ -393,7 +449,7 @@ pub fn tick(context: *VulkanContext) !void {
         .pWaitSemaphores = &semaphore_pair[PRESENT],
         .pWaitDstStageMask = &@as(u32, c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT),
         .commandBufferCount = 1,
-        .pCommandBuffers = &context.command_buffers[image_index],
+        .pCommandBuffers = &context.primary_commands[image_index],
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &semaphore_pair[RENDER],
     });
@@ -423,10 +479,14 @@ pub fn deinit(context: VulkanContext) void {
     for (context.fences) |fence| {
         c.vkDestroyFence(context.device.logical, fence, null);
     }
-    c.vkFreeCommandBuffers(context.device.logical, context.command_pool, @intCast(context.command_buffers.len), context.command_buffers.ptr);
+    c.vkFreeCommandBuffers(context.device.logical, context.command_pool, @intCast(context.primary_commands.len), context.primary_commands.ptr);
     c.vkDestroyCommandPool(context.device.logical, context.command_pool, null);
     context.swapchain.deinit(context);
     c.vkDestroyPipelineLayout(context.device.logical, context.pipeline_layout, null);
+    c.vkDestroyDescriptorSetLayout(context.device.logical, context.uniform_buffer_layout, null);
+    vk.check(c.vkFreeDescriptorSets(context.device.logical, context.descriptor_pool, 1, &context.uniform_buffer_set)) catch unreachable;
+    c.vkDestroyDescriptorPool(context.device.logical, context.descriptor_pool, null);
+    context.uniform_buffer.deinit();
     c.vkDestroyPipeline(context.device.logical, context.pipeline, null);
     c.vkDestroyRenderPass(context.device.logical, context.render_pass, null);
     context.device.deinit();

@@ -108,24 +108,44 @@ pub const Memory = struct {
     }
 };
 
-pub const UniformBufferData = struct {
-    projection: zm.Mat,
-};
 
 pub const UniformBuffer = struct {
+    pub const Data = struct {
+        model: zm.Mat,
+        view: zm.Mat,
+        projection: zm.Mat,
+
+        pub fn default(aspect: f32) @This() {
+            // Convert 0..1 to -1..1 range
+            const model = zm.transpose(zm.Mat {
+                zm.f32x4(2, 0, 0, -1),
+                zm.f32x4(0, 2, 0, -1),
+                zm.f32x4(0, 0, 1,  0),
+                zm.f32x4(0, 0, 0,  1),
+            });
+            const view = zm.lookAtLh(
+                zm.f32x4(0.0, 0.0, -2, 0.0),
+                zm.f32x4(0.0, 0.0, 0.0, 0.0),
+                zm.f32x4(0.0, 1.0, 0.0, 0.0),
+            );
+            const projection = zm.perspectiveFovLh(45, aspect, 0.1, 1000.0);
+            return .{ .model = model, .view = view, .projection = projection };
+        }
+    };
+
     device: Device,
     buffer: c.VkBuffer,
     memory: Memory,
 
     pub fn init(device: Device) !UniformBuffer {
         var buffer_info = vk.SType(c.VkBufferCreateInfo, .{
-            .size = @sizeOf(UniformBufferData),
+            .size = @sizeOf(Data),
             .usage = c.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
         });
         var buffer: c.VkBuffer = undefined;
         try vk.check(c.vkCreateBuffer(device.logical, &buffer_info, null, &buffer));
-        const memory = try Memory.fromBufs(device, @as([*]c.VkBuffer, &buffer)[0..1], c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const memory = try Memory.fromBufs(device, @as([*]c.VkBuffer, @ptrCast(&buffer))[0..1], c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         return .{
             .device = device,
             .buffer = buffer,
@@ -133,10 +153,10 @@ pub const UniformBuffer = struct {
         };
     }
 
-    pub fn update(ub: UniformBuffer, data: UniformBufferData) void {
-        const view = ub.memory.map(@sizeOf(data));
+    pub fn update(ub: UniformBuffer, data: Data) !void {
+        const view = try ub.memory.map(@sizeOf(Data));
         defer ub.memory.unmap();
-        @memcpy(view, @as([*]u8, @ptrCast(&data))[0..view.len]);
+        @memcpy(view, @as([*]const u8, @ptrCast(&data))[0..view.len]);
     }
 
     pub fn deinit(ub: UniformBuffer) void {
